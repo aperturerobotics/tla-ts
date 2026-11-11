@@ -696,7 +696,29 @@ const searchStates = (
         }
       });
     });
-  const tlcFingerprints: number[] = [];
+  // The low word of each state's TLC fingerprint, by index, which the liveness checker orders
+  // successors by; hasTlcFingerprint marks the ones computed. A successor the search never
+  // stored has no index, and its fingerprint is computed each time.
+  let tlcFingerprints = new Int32Array(0);
+  let hasTlcFingerprint = new Uint8Array(0);
+  const getTlcFingerprint = (successor: LiveSuccessor) => {
+    const index = successor.index;
+    if (index === -1) return Number(BigInt.asIntN(32, runtime.getFingerprint(successor.state)));
+    if (index >= tlcFingerprints.length) {
+      const length = Math.max(1024, 2 * tlcFingerprints.length, index + 1);
+      const grown = new Int32Array(length);
+      grown.set(tlcFingerprints);
+      tlcFingerprints = grown;
+      const marks = new Uint8Array(length);
+      marks.set(hasTlcFingerprint);
+      hasTlcFingerprint = marks;
+    }
+    if (hasTlcFingerprint[index] === 0) {
+      tlcFingerprints[index] = Number(BigInt.asIntN(32, runtime.getFingerprint(successor.state)));
+      hasTlcFingerprint[index] = 1;
+    }
+    return tlcFingerprints[index];
+  };
   if (search.properties.liveness.length > 0) {
     options.onProgress?.({
       kind: "liveness-initializing",
@@ -707,10 +729,7 @@ const searchStates = (
   const liveness = withLivenessExitCode(() =>
     withUnexpectedException(() =>
       createLivenessChecker(search.properties.liveness, spec.temporals, environment, {
-        getFingerprint: (successor) =>
-          (tlcFingerprints[successor.index] ??= Number(
-            BigInt.asIntN(32, runtime.getFingerprint(successor.state)),
-          )),
+        getFingerprint: getTlcFingerprint,
         getSuccessors: (source, state) => {
           const successors: LiveSuccessor[] = [];
           if (spec.next === undefined) return successors;
