@@ -27,6 +27,8 @@ export interface SeenStates {
   getDepth: (index: number) => number;
   /** Returns the fingerprint of every state seen, by index, as TLC orders its words. */
   getFingerprints: () => BigInt64Array;
+  /** The bytes the columns and the index take, including capacity not yet used. */
+  readonly byteLength: number;
 }
 
 const INITIAL_CAPACITY = 1 << 12;
@@ -103,5 +105,14 @@ export const createSeenStates = (): SeenStates => {
     getAction: (index) => actionNames[actions[index]],
     getDepth: (index) => depths[index],
     getFingerprints: () => new BigInt64Array(words.buffer.slice(0, count * 8)),
+    get byteLength() {
+      return (
+        words.byteLength +
+        parents.byteLength +
+        actions.byteLength +
+        depths.byteLength +
+        slots.byteLength
+      );
+    },
   };
 };
