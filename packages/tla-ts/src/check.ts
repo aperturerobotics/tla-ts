@@ -159,6 +159,11 @@ export interface CheckOptions {
   coverage?: number;
   version?: TlcVersion;
   onProgress?: (progress: CheckProgress) => void;
+  /**
+   * The directory the search's queue writes its encoded states to, in a new directory it removes
+   * when the search ends; the runtime's temporary directory, which follows TMPDIR, by default.
+   */
+  spillDirectory?: string;
 }
 
 export interface TraceSpecOptions {
@@ -215,7 +220,14 @@ export type CheckProgress =
 export interface SearchStatistics extends Pick<
   CheckResult,
   "generatedStates" | "distinctStates" | "queuedStates" | "depth" | "coverage"
-> {}
+> {
+  /** In a breadth-first search's progress, the bytes the seen states' columns and index take. */
+  seenBytes?: number;
+  /** In a breadth-first search's progress, the bytes of the queue's chunk files on disk. */
+  spillBytes?: number;
+  /** In a breadth-first search's progress, the queued states those chunk files hold. */
+  spillStates?: number;
+}
 
 export type CheckStatus =
   | "success"
@@ -757,6 +769,7 @@ const searchStates = (
     environment.variables.length,
     canonicalizeState,
     retained === undefined,
+    options.spillDirectory,
   );
   closers.push(queue.close);
   let expanding: Value[] | undefined;
@@ -1713,7 +1726,13 @@ const searchStates = (
       const progress = createResult("success");
       options.onProgress?.({
         kind: "progress",
-        statistics: { ...progress, coverage: isCoverageDue ? progress.coverage : undefined },
+        statistics: {
+          ...progress,
+          coverage: isCoverageDue ? progress.coverage : undefined,
+          seenBytes: seen.byteLength,
+          spillBytes: queue.spillBytes,
+          spillStates: queue.spillStates,
+        },
       });
     }
   }
