@@ -609,7 +609,9 @@ export const printCommandLineError = (isTool: boolean, version: TlcVersion, mess
   return 1;
 };
 
-// Deviation from TLC: tla-ts keeps its fingerprints and its queue of states in memory.
+// Deviation from TLC: the banner names tla-ts's own stores. One worker keeps 64-bit
+// fingerprints in typed arrays (SeenStates) and spills its queue of states to disk; several
+// share a fingerprint table and keep each level's states in memory.
 export const printStartupBanner = (printer: MessagePrinter, args: TlcArguments) => {
   const workers = `${args.workers} worker${args.workers === 1 ? "" : "s"} on ${availableParallelism()} cores with ${Math.floor(getHeapStatistics().heap_size_limit / 1024 / 1024)}MB heap and 0MB offheap memory [pid: ${process.pid}] (${type()} ${release()} ${arch()}, Node.js ${process.versions.node} ${process.arch.endsWith("64") ? 64 : 32}bit`;
   if (args.mode === "model-check" && args.dfidDepth !== undefined) {
@@ -624,7 +626,7 @@ export const printStartupBanner = (printer: MessagePrinter, args: TlcArguments) 
     printer.print(
       MESSAGE_CODE.modelChecking,
       MESSAGE_LEVEL.none,
-      `Running breadth-first search Model-Checking with fp ${args.fingerprintIndex} and seed ${args.seed} with ${workers}, MemFPSet, MemStateQueue).`,
+      `Running breadth-first search Model-Checking with fp ${args.fingerprintIndex} and seed ${args.seed} with ${workers}, ${args.workers === 1 ? "TypedArrayFPSet, DiskStateQueue" : "SharedFPSet, MemStateQueue"}).`,
     );
     return;
   }

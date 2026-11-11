@@ -4,6 +4,7 @@ import { TlaEvaluationError } from "./errors";
 import { isImpure, type Environment } from "./evaluate";
 import { isSameState } from "./fingerprints";
 import type { Search } from "./search";
+import type { SeenStates } from "./seen-states";
 import { getActionLabel, type SpecAction } from "./spec-description";
 import { getSuccessors, type Successor } from "./successors";
 import type { Value } from "./values";
@@ -44,11 +45,14 @@ interface TraceContext {
   search: Search;
   nextActions: SpecAction[];
   current: SearchPosition;
-  states: Value[][];
-  fingerprintStates: Value[][];
-  parents: number[];
-  actions: (string | undefined)[];
-  depths: number[];
+  seen: SeenStates;
+  // retained holds every state's values when the search keeps them; otherwise a state's values
+  // are rebuilt by replaying its path.
+  retained: Value[][] | undefined;
+  // getExpanding returns the values of the state at current.index while it is expanded.
+  getExpanding: () => Value[] | undefined;
+  // findSeen returns the index of the seen state with state's fingerprint, or -1.
+  findSeen: (state: Value[]) => number;
   tracedSteps: WeakMap<TraceStep, TracedStep>;
   captureOutput: <Result>(rebuild: () => Result) => { result: Result; lines: OutputLine[] };
   getInitialStates: () => Value[][];
@@ -68,8 +72,8 @@ export const createTraceBuilder = (context: TraceContext) => {
   const runtime = environment.runtime;
   const search = context.search;
   const current = context.current;
-  const states = context.states;
-  const depths = context.depths;
+  const seen = context.seen;
+  const retained = context.retained;
   const captureOutput = context.captureOutput;
   const is174 = runtime.version === "1.7.4";
   const isReducing = config.view !== undefined || config.symmetry !== undefined;
@@ -104,7 +108,7 @@ export const createTraceBuilder = (context: TraceContext) => {
       index,
       isExpanding: true,
       candidate: undefined,
-      rebuilt: { state: previous, level: depths[index] },
+      rebuilt: { state: previous, level: seen.getDepth(index) },
     });
     const getKey = isHeld ? (values: Value[]) => values : getFingerprintState;
     const key = getKey(state);
@@ -187,15 +191,14 @@ export const createTraceBuilder = (context: TraceContext) => {
       }
       return undefined;
     }).result;
-  const hasFingerprint = (state: Value[], index: number) =>
-    isSameState(getFingerprintState(state), context.fingerprintStates[index]);
+  const hasFingerprint = (state: Value[], index: number) => context.findSeen(state) === index;
   const findSuccessorWithFingerprint = (state: Value[], index: number) =>
     findTraceSuccessor(state, (successor) => hasFingerprint(successor.state, index));
   const getPathStates = (path: number[], nextFailure: string) => {
     const initial = captureOutput(() =>
-      isReducing || isImpure(environment)
+      retained === undefined || isReducing || isImpure(environment)
         ? context.getInitialStates().find((state) => hasFingerprint(state, path[0]))
-        : states[path[0]],
+        : retained[path[0]],
     ).result;
     if (!initial) throw new TlaEvaluationError(INITIAL_RECOVERY_FAILURE);
     const steps: Successor[] = [{ state: initial, action: undefined }];
@@ -206,7 +209,7 @@ export const createTraceBuilder = (context: TraceContext) => {
         continue;
       }
       const rebuilt = current.rebuilt;
-      current.rebuilt = { state: previous, level: depths[path[position - 1]] };
+      current.rebuilt = { state: previous, level: seen.getDepth(path[position - 1]) };
       const successor = findSuccessorWithFingerprint(previous, path[position]);
       current.rebuilt = rebuilt;
       if (!successor) throw new TlaEvaluationError(nextFailure);
@@ -214,21 +217,38 @@ export const createTraceBuilder = (context: TraceContext) => {
     }
     return steps;
   };
-  const getTrace = (index: number, lastSuccessor?: Successor) => {
+  const getPathTo = (index: number) => {
     const path: number[] = [];
-    for (let position = index; position !== -1; position = context.parents[position]) {
+    for (let position = index; position !== -1; position = seen.getParent(position)) {
       path.unshift(position);
     }
+    return path;
+  };
+  // getStoredSteps returns the states on path with the actions that reached them as the search
+  // stored them, rebuilding the states unless retained holds them.
+  const getStoredSteps = (path: number[]): Successor[] =>
+    retained
+      ? path.map((position) => ({ state: retained[position], action: seen.getAction(position) }))
+      : getPathStates(path, INITIAL_RECOVERY_FAILURE).map((step, position) => ({
+          state: step.state,
+          action: seen.getAction(path[position]),
+        }));
+  // getState returns the state at index: the one being expanded, a retained one or a rebuilt one.
+  const getState = (index: number): Value[] => {
+    const stored = index === current.index ? context.getExpanding() : retained?.[index];
+    if (stored) return stored;
+    const steps = getPathStates(getPathTo(index), INITIAL_RECOVERY_FAILURE);
+    return steps[steps.length - 1].state;
+  };
+  const getTrace = (index: number, lastSuccessor?: Successor) => {
+    const path = getPathTo(index);
     const steps =
       isReducing && path.length > 1
         ? getPathStates(path, INITIAL_RECOVERY_FAILURE)
-        : path.map((position) => ({
-            state: states[position],
-            action: context.actions[position],
-          }));
+        : getStoredSteps(path);
     if (!lastSuccessor) return toTrace(steps, path);
     const action = isReducing
-      ? findTraceSuccessor(states[index], (successor) =>
+      ? findTraceSuccessor(getState(index), (successor) =>
           isSameState(successor.state, lastSuccessor.state),
         )?.action
       : lastSuccessor.action;
@@ -236,7 +256,7 @@ export const createTraceBuilder = (context: TraceContext) => {
   };
   // Deviation from TLC: TLCTrace#printTrace prints a lone initial state without the alias.
   const getStateTrace = (index: number): Behavior =>
-    context.parents[index] === -1
+    seen.getParent(index) === -1
       ? {
           trace: [
             {
@@ -244,10 +264,10 @@ export const createTraceBuilder = (context: TraceContext) => {
               label: undefined,
               state:
                 config.alias === undefined
-                  ? toRecord(states[index])
+                  ? toRecord(getState(index))
                   : getAliasState(
                       config.alias,
-                      [{ state: states[index], action: undefined }],
+                      [{ state: getState(index), action: undefined }],
                       0,
                       undefined,
                     ),
@@ -278,5 +298,8 @@ export const createTraceBuilder = (context: TraceContext) => {
     getStateTrace,
     getFailedTrace,
     getPathSteps,
+    getPathTo,
+    getStoredSteps,
+    getState,
   };
 };

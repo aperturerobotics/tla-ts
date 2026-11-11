@@ -79,7 +79,12 @@ import {
   withHeadline,
 } from "./tlc/messages";
 import { createTlcOrder } from "./tlc/order";
-import { getTlcFingerprint, getTlcFingerprints, setFingerprintPolynomial } from "./tlc/fingerprint";
+import {
+  getTlcFingerprint,
+  getTlcFingerprints,
+  setFingerprintPolynomial,
+  writeTlcFingerprint,
+} from "./tlc/fingerprint";
 import type { TlcVersion } from "./tlc/version";
 import {
   formatValue,
@@ -707,6 +712,11 @@ export interface Search {
   spec: Specification;
   getFingerprintState: (state: Value[]) => Value[];
   getStoredFingerprints: (states: Value[][], fingerprintStates: Value[][]) => BigInt64Array;
+  /**
+   * Writes the TLC fingerprint of a state, given as getFingerprintState returned it, to out as
+   * its low and high words: the same fingerprint getStoredFingerprints returns for that state.
+   */
+  writeFingerprint: (fingerprintState: Value[], out: Int32Array) => void;
   getTlcOrder: () => number[];
   isSymmetric: boolean;
   isConstrained: boolean;
@@ -1279,6 +1289,15 @@ export const createSearch = (
         return BigInt64Array.from(states, getTlcStateFingerprint);
       }
       return getTlcFingerprints(fingerprintStates, getTlcOrder());
+    },
+    writeFingerprint: (fingerprintState, out) => {
+      if (!isFingerprintedLikeTlc) {
+        writeTlcFingerprint(fingerprintState, view === undefined ? getTlcOrder() : undefined, out);
+        return;
+      }
+      const fingerprint = BigInt(fingerprintState[0] as string);
+      out[0] = Number(BigInt.asIntN(32, fingerprint));
+      out[1] = Number(BigInt.asIntN(32, fingerprint >> 32n));
     },
     getFingerprintState: (state) => {
       if (isFingerprintedLikeTlc) return [String(getTlcStateFingerprint(state))];

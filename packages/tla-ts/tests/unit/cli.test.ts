@@ -596,7 +596,7 @@ describe("the CLI reports results like TLC", () => {
     const lines = result.stdout.split("\n");
     expect(lines[0]).toMatch(/^TLC2 Version \d+\.\d+\.\d+ \(rev: tla-ts\)$/);
     expect(lines[1]).toMatch(
-      /^Running breadth-first search Model-Checking with fp 0 and seed 7 with 2 workers on \d+ cores with \d+MB heap and 0MB offheap memory \[pid: \d+\] \(.+, Node\.js .+, MemFPSet, MemStateQueue\)\.$/,
+      /^Running breadth-first search Model-Checking with fp 0 and seed 7 with 2 workers on \d+ cores with \d+MB heap and 0MB offheap memory \[pid: \d+\] \(.+, Node\.js .+, SharedFPSet, MemStateQueue\)\.$/,
     );
     expect(lines[2]).toBe(`Parsing file ${realpathSync(join(directory, "Success.tla"))}`);
     const standardModules = ["Naturals", "_TLCTrace", "TLC", "TLCExt", "Sequences", "FiniteSets"];

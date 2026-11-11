@@ -18,6 +18,9 @@ export interface JavaRandom {
   nextInt: (bound: number) => number;
   nextLong: () => bigint;
   nextDouble: () => number;
+  /** Returns the stream's position, which setPosition takes to draw the same values again. */
+  getPosition: () => bigint;
+  setPosition: (position: bigint) => void;
 }
 
 const MULTIPLIER = 0x5deece66dn;
@@ -44,6 +47,10 @@ export const createJavaRandom = (seed: bigint): JavaRandom => {
     },
     nextLong: () => BigInt.asIntN(64, (BigInt(next(32)) << 32n) + BigInt(next(32))),
     nextDouble: () => (next(26) * 2 ** 27 + next(27)) * 2 ** -53,
+    getPosition: () => state,
+    setPosition: (position) => {
+      state = position;
+    },
   };
 };
 

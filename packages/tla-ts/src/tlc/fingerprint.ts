@@ -346,6 +346,27 @@ export const getTlcFingerprint = (state: Value[]) => {
   return fingerprint;
 };
 
+/**
+ * Writes the TLC fingerprint of values, taken in order's positions when order is given, to
+ * out as its low and high words, without allocating a bigint.
+ */
+export const writeTlcFingerprint = (
+  values: Value[],
+  order: number[] | undefined,
+  out: Int32Array,
+) => {
+  const outerHigh = high;
+  const outerLow = low;
+  high = initialHigh;
+  low = initialLow;
+  if (order === undefined) for (const value of values) extendValue(value);
+  else for (const index of order) extendValue(values[index]);
+  out[0] = low;
+  out[1] = high;
+  high = outerHigh;
+  low = outerLow;
+};
+
 // Fingerprints each of count states from the values extend adds for it.
 const getExtendedFingerprints = (count: number, extend: (position: number) => void) => {
   const fingerprints = new BigInt64Array(count);

@@ -18,6 +18,14 @@ export interface CheckerRuntime {
     | ((key: string, state: (Value | undefined)[] | undefined) => Value | undefined)
     | undefined;
   evaluateAtStartup: <Result>(evaluate: () => Result) => Result;
+  /** Marks where the startup random stream stands as the search's walk of Init begins. */
+  startInitialStates: () => void;
+  /**
+   * Runs evaluate, a replay of Init, at startup with the startup random stream where
+   * startInitialStates marked it, so Init draws the values it drew in the search even while a
+   * state is current, then puts the stream back.
+   */
+  replayInitialStates: <Result>(evaluate: () => Result) => Result;
   pause: (() => void) | undefined;
   warn: (code: number, text: string) => void;
   isWarningEnabled: boolean;
@@ -46,6 +54,7 @@ export const createRuntime = (checkDeadlock: boolean, seed = 0n): CheckerRuntime
   const workerRandom = createJavaRandom(seed);
   let seededState: Value[] | undefined;
   let isStartup = false;
+  let initialPosition = startupRandom.getPosition();
   const runtime: CheckerRuntime = {
     getLevel: () => 0,
     getBehavior: () => [],
@@ -74,6 +83,18 @@ export const createRuntime = (checkDeadlock: boolean, seed = 0n): CheckerRuntime
         return evaluate();
       } finally {
         isStartup = wasStartup;
+      }
+    },
+    startInitialStates: () => {
+      initialPosition = startupRandom.getPosition();
+    },
+    replayInitialStates: (evaluate) => {
+      const position = startupRandom.getPosition();
+      startupRandom.setPosition(initialPosition);
+      try {
+        return runtime.evaluateAtStartup(evaluate);
+      } finally {
+        startupRandom.setPosition(position);
       }
     },
     pause: undefined,
