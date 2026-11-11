@@ -694,7 +694,7 @@ const describeFallback = (reason: FallbackReason) => {
     case "string":
       return `the search ordered the string ${JSON.stringify(reason.string)} against another string it created, ${again}. Workers don't agree on the order of strings the search creates.`;
     case "violation":
-      return `a worker found a violation or a deadlock, ${again} to build its trace.`;
+      return `a worker found a violation or a deadlock that searching again along its path did not reach, ${again} to build its trace.`;
     case "error":
       return `a worker failed (${reason.message}), ${again}.`;
     case "unsupported":

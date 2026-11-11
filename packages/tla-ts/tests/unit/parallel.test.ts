@@ -7,12 +7,29 @@ const DIST = join(import.meta.dirname, "../../dist/index.js");
 
 const tlaTs: typeof import("../../src") = await import(DIST);
 
-const checkFixtureInParallel = (directory: string, name: string, workers: number) =>
+const checkFixtureInParallel = (
+  directory: string,
+  name: string,
+  workers: number,
+  onProgress?: (progress: { kind: string }) => void,
+) =>
   tlaTs.check({
     source: readFileSync(join(FIXTURES, directory, `${name}.tla`), "utf8"),
     config: readFileSync(join(FIXTURES, directory, `${name}.cfg`), "utf8"),
     workers,
+    onProgress,
   });
+
+// checkWithoutFallback checks a fixture whose trace the workers rebuild along their parent log,
+// without searching every state again on one thread.
+const checkWithoutFallback = async (directory: string, name: string, workers: number) => {
+  const kinds: string[] = [];
+  const result = await checkFixtureInParallel(directory, name, workers, ({ kind }) =>
+    kinds.push(kind),
+  );
+  expect(kinds).not.toContain("sequential-fallback");
+  return result;
+};
 
 const getCounts = (result: { generatedStates: number; distinctStates: number; depth: number }) => [
   result.generatedStates,
@@ -158,16 +175,18 @@ describe("check with workers matches TLC", () => {
     expect(getCounts(result)).toEqual([42, 10, 7]);
   });
 
-  it("reports the shortest invariant violation trace like one worker", async () => {
-    const result = await checkFixtureInParallel("water-jugs", "WaterJugs", 4);
+  it("reports a shortest invariant violation trace with the counts the workers reached", async () => {
+    const result = await checkWithoutFallback("water-jugs", "WaterJugs", 4);
     expect(result.status).toBe("invariant-violation");
     expect(result.violation?.name).toBe("GoalNotReached");
     expect(result.violation?.trace).toHaveLength(7);
-    expect(getCounts(result)).toEqual([73, 14, 7]);
+    // The counts depend on how far the other workers got into the last level, as in TLC's.
+    expect(result.depth).toBe(7);
+    expect(result.distinctStates).toBeGreaterThan(7);
   });
 
-  it("reports deadlock with its trace like one worker", async () => {
-    const result = await checkFixtureInParallel("counter", "Counter", 2);
+  it("reports deadlock with a shortest trace", async () => {
+    const result = await checkWithoutFallback("counter", "Counter", 2);
     expect(result.status).toBe("deadlock");
     expect(result.violation?.trace.map((step) => step.action)).toEqual([
       undefined,

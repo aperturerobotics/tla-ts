@@ -199,7 +199,10 @@ export type OutputLine = string | InitialStatesProgress | InitialStateViolation;
 export type FallbackReason =
   /** The search ordered a string it created against another; workers don't share that order. */
   | { kind: "string"; string: string }
-  /** A worker found a violation or a deadlock; one thread rebuilds its trace. */
+  /**
+   * A worker found a violation or a deadlock, and searching again along the path to it did not
+   * reach it; one thread searches every state again for the trace.
+   */
   | { kind: "violation" }
   /** A worker failed, such as by running out of memory. */
   | { kind: "error"; message: string }
@@ -357,12 +360,17 @@ const appendTraceOutput = <Traced extends Behavior>(behavior: Traced, lines: Out
 const STOP_REPLAY = new Error("The replay stopped");
 const STOP_WALK = new Error("The walk stopped");
 
-export const checkSequentially = (options: CheckOptions): CheckResult => {
+/**
+ * Checks on the calling thread. With path, the fingerprints of the states from an initial state
+ * to one a parallel search stopped on, it stores only those states, so it reaches that state's
+ * violation or error in as many levels as the path has, with that trace.
+ */
+export const checkSequentially = (options: CheckOptions, path?: Set<bigint>): CheckResult => {
   const stateWriter =
     options.dump && createStateWriter(options.dump, options.writeFile, options.version);
   const closers: (() => void)[] = [];
   try {
-    return searchStates(options, stateWriter, closers);
+    return searchStates(options, stateWriter, closers, path);
   } catch (error) {
     throw isStackOverflow(error) ? createStackOverflowError() : error;
   } finally {
@@ -381,6 +389,7 @@ const searchStates = (
   options: CheckOptions,
   stateWriter: StateWriter | undefined,
   closers: (() => void)[],
+  guidedPath: Set<bigint> | undefined,
 ): CheckResult => {
   const config =
     typeof options.config === "string"
@@ -923,6 +932,10 @@ const searchStates = (
     searchDepth = Math.max(searchDepth, depth);
     runtime.diameter = Math.max(runtime.diameter, depth);
   };
+  // isOnPath reports whether the search stores the state whose fingerprint words are low and high.
+  const isOnPath = (low: number, high: number) =>
+    guidedPath === undefined ||
+    guidedPath.has(BigInt.asIntN(64, (BigInt(high) << 32n) | BigInt(low >>> 0)));
   // addState stores a new state whose fingerprint words are low and high and queues it.
   const addState = (
     state: Value[],
@@ -1071,7 +1084,7 @@ const searchStates = (
         ...traces.toTrace([{ action: undefined, state }], []),
       });
     }
-    if (!isInModel) return undefined;
+    if (!isInModel || !isOnPath(low, high)) return undefined;
     addState(state, low, high, -1, undefined);
     return undefined;
   };
@@ -1171,7 +1184,7 @@ const searchStates = (
       return withOutDegrees(reportViolation("liveness-violation", propertyViolation));
     }
     if (propertyViolation) reportContinuedViolation("liveness-violation", propertyViolation);
-    if (!isNew) return undefined;
+    if (!isNew || !isOnPath(low, high)) return undefined;
     if (coverage) countCoverageVariables(coverage, successor.state);
     if (!isCanonicalizedFirst) canonicalizeState(successor.state);
     addState(successor.state, low, high, index, successor.action);
@@ -1192,6 +1205,8 @@ const searchStates = (
     options.dump === undefined &&
     // A set of small integers on the tier is a 31-bit mask, which a lower bound could overflow.
     options.maxSetSize === undefined &&
+    // The tier searches every state, where a guided search keeps only those on its path.
+    guidedPath === undefined &&
     !hasPostconditions
       ? search.getTypedChecks(liveness?.solutions)
       : undefined;

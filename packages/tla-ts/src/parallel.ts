@@ -60,19 +60,34 @@ interface LevelMessage {
   generated: number;
   added: number;
   outDegrees: number[];
+  /** The fingerprint of each state the level added. */
   fingerprints: BigInt64Array;
+  /** The fingerprint of the state each of fingerprints was found from. */
+  parents: BigInt64Array;
 }
 
-export type WorkerMessage =
-  | { type: "ready" }
-  | { type: "abort"; reason: FallbackReason }
-  | { type: "paused" }
-  | LevelMessage;
+interface AbortMessage {
+  type: "abort";
+  reason: FallbackReason;
+  /** The fingerprint of the state the worker was expanding when it stopped. */
+  parent?: bigint;
+  /** The states the stopped level generated and added before it stopped. */
+  generated?: number;
+  added?: number;
+}
+
+export type WorkerMessage = { type: "ready" } | AbortMessage | { type: "paused" } | LevelMessage;
 
 export type CoordinatorMessage =
   | { type: "level" }
   | { type: "resize"; fingerprints: SharedFingerprints };
 
+/**
+ * Checks a model, with options.workers threads searching each level breadth first when the model
+ * allows it. A success gives the same counts as one worker. A violation, a deadlock or an error
+ * gives a shortest trace to it, which need not be the one a single worker finds first, with the
+ * counts the workers reached when one stopped, as TLC's workers do.
+ */
 export const check = async (options: CheckOptions): Promise<CheckResult> => {
   const config =
     typeof options.config === "string"
@@ -92,17 +107,25 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
     reported.add(getKey(progress));
     options.onProgress?.(progress);
   };
+  // searchAgain checks on the calling thread from the initial states, storing only the states path
+  // holds when it is set, and leaves out what this search already printed and reported.
+  const searchAgain = (path?: Set<bigint>) => {
+    let skippedCount = printedCount;
+    return checkSequentially(
+      {
+        ...options,
+        config,
+        onPrint: (text) => (skippedCount-- > 0 ? undefined : print(text)),
+        onProgress: (progress) => {
+          if (!reported.has(getKey(progress))) options.onProgress?.(progress);
+        },
+      },
+      path,
+    );
+  };
   const fallBack = (reason?: FallbackReason) => {
     if (reason !== undefined) options.onProgress?.({ kind: "sequential-fallback", reason });
-    let skippedCount = printedCount;
-    return checkSequentially({
-      ...options,
-      config,
-      onPrint: (text) => (skippedCount-- > 0 ? undefined : print(text)),
-      onProgress: (progress) => {
-        if (!reported.has(getKey(progress))) options.onProgress?.(progress);
-      },
-    });
+    return searchAgain();
   };
   const workerCount = options.workers ?? 1;
   if (workerCount < 2) return fallBack();
@@ -166,24 +189,55 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
     outDegrees: Array.from({ length: OUT_DEGREE_BUCKETS }, () => 0),
   };
   const tlcFingerprints: BigInt64Array[] = [];
+  // The parent log: for each level after the first, each worker's added fingerprints and the
+  // fingerprint of the state each was found from.
+  const levelLogs: LevelMessage[][] = [];
+  const getDistance = () =>
+    getFingerprintDistance(statistics.distinctStates, statistics.generatedStates, (visit) => {
+      const fingerprints = new BigInt64Array(statistics.distinctStates);
+      tlcFingerprints.reduce((offset, level) => {
+        fingerprints.set(level, offset);
+        return offset + level.length;
+      }, 0);
+      visit(fingerprints);
+    });
   const createSuccess = (): CheckResult => ({
     status: "success",
     violation: undefined,
     failure: undefined,
     ...statistics,
-    fingerprintDistance: getFingerprintDistance(
-      statistics.distinctStates,
-      statistics.generatedStates,
-      (visit) => {
-        const fingerprints = new BigInt64Array(statistics.distinctStates);
-        tlcFingerprints.reduce((offset, level) => {
-          fingerprints.set(level, offset);
-          return offset + level.length;
-        }, 0);
-        visit(fingerprints);
-      },
-    ),
+    fingerprintDistance: getDistance(),
   });
+  // findPath returns the fingerprints of the states from an initial state to the state with
+  // fingerprint last, which the last level added, by walking the parent log back.
+  const findPath = (last: bigint) => {
+    const path = new Set([last]);
+    let target = last;
+    for (let level = levelLogs.length - 1; level >= 0; level--) {
+      const parent = findParent(levelLogs[level], target);
+      if (parent === undefined) return undefined;
+      path.add(parent);
+      target = parent;
+    }
+    return path;
+  };
+  // stop rebuilds the trace of a worker that stopped on a state: the calling thread searches
+  // again along the path to it, which reaches the same violation or error in a few levels, and
+  // reports this search's counts. It searches every state again only if the path doesn't.
+  const stop = (abort: AbortMessage) => {
+    const path = abort.parent === undefined ? undefined : findPath(abort.parent);
+    const guided = path && searchAgain(path);
+    if (!guided || guided.status === "success") return fallBack(abort.reason);
+    return {
+      ...guided,
+      generatedStates: statistics.generatedStates + (abort.generated ?? 0),
+      distinctStates: statistics.distinctStates + (abort.added ?? 0),
+      queuedStates: statistics.queuedStates,
+      initialStates: statistics.initialStates,
+      outDegrees: guided.outDegrees && statistics.outDegrees,
+      fingerprintDistance: guided.fingerprintDistance && getDistance(),
+    };
+  };
   const seedInitialStates = (init: Expression) => {
     const seeded: Value[][] = [];
     for (const state of getInitialStates(init, environment, search.spec.scope)) {
@@ -290,7 +344,7 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
     worker.postMessage(message, [...ports.filter((port) => port !== undefined), seed.words.buffer]);
   });
   const findAbort = (messages: WorkerMessage[]) =>
-    messages.find((message) => message.type === "abort")?.reason;
+    messages.find((message) => message.type === "abort");
   const send = (message: CoordinatorMessage) =>
     workers.forEach((worker) => worker.postMessage(message));
   const collectLevels = async (messages: WorkerMessage[]): Promise<WorkerMessage[]> => {
@@ -305,7 +359,7 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
   const startAbort = findAbort(await ready);
   if (startAbort) {
     terminate();
-    return fallBack(startAbort);
+    return fallBack(startAbort.reason);
   }
   let progressAt = performance.now() + PROGRESS_INTERVAL;
   for (;;) {
@@ -316,12 +370,14 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
     const abort = findAbort(messages);
     if (abort) {
       terminate();
-      return fallBack(abort);
+      return stop(abort);
     }
     const levels = messages.flatMap((message) => (message.type === "level" ? [message] : []));
     const added = levels.reduce((sum, message) => sum + message.added, 0);
     statistics.generatedStates += levels.reduce((sum, message) => sum + message.generated, 0);
     statistics.distinctStates += added;
+    statistics.queuedStates = added;
+    levelLogs.push(levels);
     levels.forEach((message) => {
       message.outDegrees.forEach(
         (degreeCount, degree) => (statistics.outDegrees[degree] += degreeCount),
@@ -349,6 +405,15 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
       });
     }
   }
+};
+
+/** Returns the fingerprint of the parent of the state with fingerprint child in one level's log. */
+const findParent = (level: LevelMessage[], child: bigint) => {
+  for (const log of level) {
+    const index = log.fingerprints.indexOf(child);
+    if (index !== -1) return log.parents[index];
+  }
+  return undefined;
 };
 
 /** Returns the message of a worker's error event or thrown value. */

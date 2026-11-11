@@ -4,6 +4,7 @@ import {
   isSharedFingerprintsFull,
   writeStateFingerprint,
 } from "./fingerprints";
+import type { FallbackReason } from "./check";
 import type { CoordinatorMessage, StartMessage, WorkerMessage } from "./parallel";
 import { createCheckEnvironment, createSearch } from "./search";
 import { getSuccessors, type Successor } from "./successors";
@@ -15,8 +16,16 @@ import { createBreak, getParentPort, type Port } from "./worker";
 const LOCKED = -1;
 const BREAK_INTERVAL = 100;
 
+/** States a worker sends a thief, with their fingerprints in the same order. */
+interface Loot {
+  states: EncodedStates;
+  fingerprints: BigInt64Array;
+}
+
 interface Expansion {
   states: Value[][];
+  /** The fingerprint of each of states, as getStoredFingerprints returns it. */
+  fingerprints: BigInt64Array;
   origin: number;
   end: number;
   successors: Successor[] | undefined;
@@ -26,6 +35,10 @@ interface Expansion {
   outDegrees: number[];
   next: Value[][];
   fingerprintStates: Value[][];
+  /** The fingerprint of the state each of next was found from. */
+  parents: BigInt64Array;
+  /** Whether the level stopped on a new state, which TLC counts as distinct though no one queues it. */
+  isStoppedOnNew: boolean;
   breakAt: number;
 }
 
@@ -59,12 +72,16 @@ const runWorker = (start: StartMessage, parent: Port) => {
   const generatedStates = search.isSymmetric ? createFingerprintTable() : undefined;
   const fingerprint = new Int32Array(2);
   let resumeLevel = () => {};
-  let receiveLoot = (_states: EncodedStates) => {};
+  let receiveLoot = (_loot: Loot) => {};
   start.ports.forEach((port) => {
-    port?.addEventListener("message", (event) => receiveLoot(event.data as EncodedStates));
+    port?.addEventListener("message", (event) => receiveLoot(event.data as Loot));
     port?.start?.();
   });
   let frontier = decode(start.seed).map(canonicalize);
+  let frontierFingerprints = search.getStoredFingerprints(
+    frontier,
+    frontier.map(search.getFingerprintState),
+  );
   const takeBreak = createBreak();
 
   const answerRequest = (expansion: Expansion, request: number) => {
@@ -73,9 +90,14 @@ const runWorker = (start: StartMessage, parent: Port) => {
     const encoder = createStateEncoder();
     const states = expansion.states.slice(expansion.end - given, expansion.end);
     const isEncoded = given > 0 && states.every(encoder.encode);
+    const loot: Loot = {
+      states: isEncoded ? encoder.finish() : createStateEncoder().finish(),
+      fingerprints: isEncoded
+        ? expansion.fingerprints.slice(expansion.end - given, expansion.end)
+        : new BigInt64Array(0),
+    };
     if (isEncoded) expansion.end -= given;
-    const loot = isEncoded ? encoder.finish() : createStateEncoder().finish();
-    start.ports[thief]?.postMessage(loot, [loot.words.buffer]);
+    start.ports[thief]?.postMessage(loot, [loot.states.words.buffer, loot.fingerprints.buffer]);
     Atomics.store(requests, workerIndex, request);
     Atomics.notify(requests, workerIndex);
   };
@@ -120,8 +142,16 @@ const runWorker = (start: StartMessage, parent: Port) => {
         const fingerprintState = search.getFingerprintState(successor.state);
         writeStateFingerprint(fingerprintState, fingerprint);
         if (!insertSharedFingerprint(sharedFingerprints, fingerprint[0], fingerprint[1])) continue;
+        expansion.isStoppedOnNew = true;
         if (search.findViolatedInvariant(successor.state, state)) return undefined;
+        expansion.isStoppedOnNew = false;
         if (!search.satisfiesConstraints(successor.state, state)) continue;
+        if (expansion.next.length === expansion.parents.length) {
+          const grown = new BigInt64Array(2 * expansion.parents.length);
+          grown.set(expansion.parents);
+          expansion.parents = grown;
+        }
+        expansion.parents[expansion.next.length] = expansion.fingerprints[expansion.origin];
         expansion.next.push(successor.state);
         expansion.fingerprintStates.push(fingerprintState);
         expansion.added++;
@@ -148,12 +178,13 @@ const runWorker = (start: StartMessage, parent: Port) => {
       if (request === LOCKED) skipped.add(victim);
       if (request > 0) Atomics.wait(requests, victim, request);
       if (request !== 0) continue;
-      const loot = await new Promise<EncodedStates>((resolve) => (receiveLoot = resolve));
-      if (loot.count === 0) {
+      const loot = await new Promise<Loot>((resolve) => (receiveLoot = resolve));
+      if (loot.states.count === 0) {
         skipped.add(victim);
         continue;
       }
-      expansion.states = decode(loot).map(canonicalize);
+      expansion.states = decode(loot.states).map(canonicalize);
+      expansion.fingerprints = loot.fingerprints;
       expansion.origin = 0;
       expansion.end = expansion.states.length;
       unlockRequests(expansion);
@@ -162,11 +193,15 @@ const runWorker = (start: StartMessage, parent: Port) => {
   };
 
   const report = (message: WorkerMessage) =>
-    parent.postMessage(message, message.type === "level" ? [message.fingerprints.buffer] : []);
+    parent.postMessage(
+      message,
+      message.type === "level" ? [message.fingerprints.buffer, message.parents.buffer] : [],
+    );
 
   const runLevel = async (): Promise<WorkerMessage> => {
     const expansion: Expansion = {
       states: frontier,
+      fingerprints: frontierFingerprints,
       origin: 0,
       end: frontier.length,
       successors: undefined,
@@ -176,11 +211,27 @@ const runWorker = (start: StartMessage, parent: Port) => {
       outDegrees: Array.from({ length: OUT_DEGREE_BUCKETS }, () => 0),
       next: [],
       fingerprintStates: [],
+      parents: new BigInt64Array(1024),
+      isStoppedOnNew: false,
       breakAt: performance.now() + BREAK_INTERVAL,
     };
+    // A violation or an error stops the level on the state at origin, which the coordinator
+    // finds again by its fingerprint to rebuild the trace.
+    const stopAt = (reason: FallbackReason): WorkerMessage => ({
+      type: "abort",
+      reason,
+      parent: expansion.fingerprints[expansion.origin],
+      generated: expansion.generated,
+      added: expansion.next.length + (expansion.isStoppedOnNew ? 1 : 0),
+    });
     for (;;) {
-      const status = expand(expansion);
-      if (status === undefined) return { type: "abort", reason: { kind: "violation" } };
+      let status: ReturnType<typeof expand>;
+      try {
+        status = expand(expansion);
+      } catch (error) {
+        return stopAt(abortWith(error).reason);
+      }
+      if (status === undefined) return stopAt({ kind: "violation" });
       // HACK: Bun frees memory on event loop timers, so a long level returns to the loop.
       if (status === "break") {
         await takeBreak();
@@ -202,13 +253,16 @@ const runWorker = (start: StartMessage, parent: Port) => {
       return { type: "abort", reason: { kind: "string", string: unorderedString } };
     }
     frontier = expansion.next;
+    const fingerprints = search.getStoredFingerprints(expansion.next, expansion.fingerprintStates);
+    frontierFingerprints = fingerprints.slice();
     Atomics.store(remaining, workerIndex, frontier.length);
     return {
       type: "level",
       generated: expansion.generated,
       added: expansion.next.length,
       outDegrees: expansion.outDegrees,
-      fingerprints: search.getStoredFingerprints(expansion.next, expansion.fingerprintStates),
+      fingerprints,
+      parents: expansion.parents.slice(0, expansion.next.length),
     };
   };
 
@@ -246,7 +300,7 @@ void getParentPort().then((parent) => {
 });
 
 /** Returns the abort that carries a worker's failure to the coordinator. */
-const abortWith = (error: unknown): WorkerMessage => ({
+const abortWith = (error: unknown): Extract<WorkerMessage, { type: "abort" }> => ({
   type: "abort",
   reason: { kind: "error", message: error instanceof Error ? error.message : String(error) },
 });
