@@ -101,19 +101,19 @@ interface BehaviorGraph<State> {
   solution: Solution;
   checks: BehaviorChecks<State>;
   actionIds: Int32Array;
-  nodeStates: number[];
-  nodeTableaux: number[];
-  edgeStarts: number[];
-  edgeCounts: number[];
+  nodeStates: Pool<Int32Array>;
+  nodeTableaux: Pool<Int32Array>;
+  edgeStarts: Pool<Int32Array>;
+  edgeCounts: Pool<Int32Array>;
   edgeTargets: Pool<Int32Array>;
   edgeActions: Pool<Uint8Array>;
   stateResults: Pool<Uint8Array>;
   initial: number[];
   firstNodes: Pool<Int32Array>;
   lastNodes: Pool<Int32Array>;
-  nextSiblings: number[];
+  nextSiblings: Pool<Int32Array>;
   nodeIds: NodeTable;
-  isDone: boolean[];
+  isDone: Pool<Uint8Array>;
   errorNode: number | undefined;
 }
 
@@ -171,6 +171,15 @@ const writeToPool = <Data extends Int32Array | Uint8Array>(
   pool.length = Math.max(pool.length, end);
 };
 
+const pushToPool = <Data extends Int32Array | Uint8Array>(pool: Pool<Data>, value: number) => {
+  if (pool.length === pool.data.length) {
+    const data = pool.create(2 * pool.data.length);
+    data.set(pool.data);
+    pool.data = data;
+  }
+  pool.data[pool.length++] = value;
+};
+
 const NO_NODE = -1;
 
 // A Map holds at most 2^24 entries, so an open-addressing table of (state plus one, tableau node, node) triples finds each node.
@@ -197,25 +206,26 @@ const createNodes = (length: number) => new Int32Array(length).fill(NO_NODE);
 const UNWRITTEN = -1;
 
 const isWritten = <State>(behavior: BehaviorGraph<State>, node: number) =>
-  (behavior.edgeStarts[node] ?? UNWRITTEN) !== UNWRITTEN;
+  node < behavior.edgeStarts.length && behavior.edgeStarts.data[node] !== UNWRITTEN;
 
 const getNodeSuccessors = <State>(behavior: BehaviorGraph<State>, node: number) => {
-  const start = behavior.edgeStarts[node];
-  return behavior.edgeTargets.data.subarray(start, start + behavior.edgeCounts[node]);
+  const start = behavior.edgeStarts.data[node];
+  return behavior.edgeTargets.data.subarray(start, start + behavior.edgeCounts.data[node]);
 };
 
 const getStateResult = <State>(behavior: BehaviorGraph<State>, node: number, position: number) =>
   behavior.stateResults.data[
-    behavior.nodeStates[node] * behavior.solution.stateChecks.length + position
+    behavior.nodeStates.data[node] * behavior.solution.stateChecks.length + position
   ] === 1;
 
 const pushNode = <State>(behavior: BehaviorGraph<State>, state: number, tableauNode: number) => {
-  behavior.nodeStates.push(state);
-  behavior.nodeTableaux.push(tableauNode);
-  behavior.edgeStarts.push(UNWRITTEN);
-  behavior.edgeCounts.push(0);
-  behavior.nextSiblings.push(NO_NODE);
-  return behavior.nodeStates.length - 1;
+  const node = behavior.nodeStates.length;
+  pushToPool(behavior.nodeStates, state);
+  pushToPool(behavior.nodeTableaux, tableauNode);
+  pushToPool(behavior.edgeStarts, UNWRITTEN);
+  pushToPool(behavior.edgeCounts, 0);
+  pushToPool(behavior.nextSiblings, NO_NODE);
+  return node;
 };
 
 const getStateNodes = <State>(behavior: BehaviorGraph<State>, state: number) => {
@@ -223,7 +233,7 @@ const getStateNodes = <State>(behavior: BehaviorGraph<State>, state: number) => 
   for (
     let node = behavior.firstNodes.data[state] ?? NO_NODE;
     node !== NO_NODE;
-    node = behavior.nextSiblings[node]
+    node = behavior.nextSiblings.data[node]
   ) {
     nodes.push(node);
   }
@@ -492,19 +502,19 @@ export const createLiveGraph = <State>(
       actionIds.set(key, actionId);
       return actionId;
     }),
-    nodeStates: [],
-    nodeTableaux: [],
-    edgeStarts: [],
-    edgeCounts: [],
+    nodeStates: createPool((length) => new Int32Array(length)),
+    nodeTableaux: createPool((length) => new Int32Array(length)),
+    edgeStarts: createPool((length) => new Int32Array(length)),
+    edgeCounts: createPool((length) => new Int32Array(length)),
     edgeTargets: createPool((length) => new Int32Array(length)),
     edgeActions: createPool((length) => new Uint8Array(length)),
     stateResults: createPool((length) => new Uint8Array(length)),
     initial: [],
     firstNodes: createPool(createNodes),
     lastNodes: createPool(createNodes),
-    nextSiblings: [],
+    nextSiblings: createPool((length) => new Int32Array(length)),
     nodeIds: { slots: new Int32Array(3 << 10), size: 0, shift: 22 },
-    isDone: [],
+    isDone: createPool((length) => new Uint8Array(length)),
     errorNode: undefined,
   }));
   const checkState = (
@@ -619,7 +629,7 @@ export const createLiveGraph = <State>(
     table.slots.set([state + 1, tableauNode, node], getNodeSlot(table, state, tableauNode));
     const last = behavior.lastNodes.data[state] ?? NO_NODE;
     if (last === NO_NODE) writeToPool(behavior.firstNodes, state, [node]);
-    else behavior.nextSiblings[last] = node;
+    else behavior.nextSiblings.data[last] = node;
     writeToPool(behavior.lastNodes, state, [node]);
     return node;
   };
@@ -646,11 +656,11 @@ export const createLiveGraph = <State>(
     );
     writeToPool(
       behavior.stateResults,
-      behavior.nodeStates[node] * stateResults.length,
+      behavior.nodeStates.data[node] * stateResults.length,
       stateResults,
     );
-    behavior.edgeStarts[node] = start;
-    behavior.edgeCounts[node] = targets.length;
+    behavior.edgeStarts.data[node] = start;
+    behavior.edgeCounts.data[node] = targets.length;
   };
 
   // TLC iterates a state's successors and the state itself in the slot order of a SetOfStates, a hash set whose capacity grows with every set that outgrows it.
@@ -706,7 +716,7 @@ export const createLiveGraph = <State>(
     offset: number,
   ) => {
     const stateResults = checkState(behavior, index, state, row, offset);
-    const tableauNode = tableau.nodes[behavior.nodeTableaux[node]];
+    const tableauNode = tableau.nodes[behavior.nodeTableaux.data[node]];
     const actionCount = behavior.checks.actions.length;
     const actions: number[] = [];
     const successors: number[] = [];
@@ -750,7 +760,7 @@ export const createLiveGraph = <State>(
         actionResults,
         (position + 1) * actionCount,
       );
-      const isDone = behavior.isDone[successor.index] === true;
+      const isDone = behavior.isDone.data[successor.index] === 1;
       for (const next of tableauNode.successors) {
         if (!isConsistent(behavior, next, index, successor.state, successorRow, 0)) continue;
         // Deviation from TLC: TLC records the node of a successor the search never stored, which it never expands.
@@ -791,14 +801,14 @@ export const createLiveGraph = <State>(
         }
       }
     });
-    behavior.isDone[index] = true;
+    writeToPool(behavior.isDone, index, [1]);
     // TLC expands the nodes recorded before the loop, not the ones the loop records.
     for (const node of getStateNodes(behavior, index)) {
       const successors: number[] = [];
       const actions: number[] = [];
       set.forEach((successor, position) => {
-        const isDone = behavior.isDone[successor.index] === true;
-        for (const next of tableau.nodes[behavior.nodeTableaux[node]].successors) {
+        const isDone = behavior.isDone.data[successor.index] === 1;
+        for (const next of tableau.nodes[behavior.nodeTableaux.data[node]].successors) {
           if (consistency[next * set.length + position] === 0) continue;
           const existing = getNodeId(behavior, successor.index, next);
           if (existing !== undefined && successors.includes(existing)) continue;
@@ -873,7 +883,7 @@ export const createLiveGraph = <State>(
     removeRepeats(
       getPath(behavior, target)
         .reverse()
-        .map((node) => behavior.nodeStates[node]),
+        .map((node) => behavior.nodeStates.data[node]),
     );
 
   const findLassoInModel = (
@@ -883,7 +893,9 @@ export const createLiveGraph = <State>(
     const solution = behavior.solution;
     const actionCount = solution.actionChecks.length;
     const getAction = (node: number, edge: number, position: number) =>
-      behavior.edgeActions.data[(behavior.edgeStarts[node] + edge) * actionCount + position] === 1;
+      behavior.edgeActions.data[
+        (behavior.edgeStarts.data[node] + edge) * actionCount + position
+      ] === 1;
     const isAllowed = (node: number, edge: number) =>
       model.eventuallyAlways.every((position) => getAction(node, edge, position));
     const links = new Float64Array(behavior.nodeStates.length).fill(UNVISITED);
@@ -896,7 +908,7 @@ export const createLiveGraph = <State>(
     };
     const isFulfilled = (node: number, promise: Solution["promises"][number]) =>
       solution.tableau !== undefined &&
-      isFulfilling(solution.tableau.nodes[behavior.nodeTableaux[node]].particle, promise);
+      isFulfilling(solution.tableau.nodes[behavior.nodeTableaux.data[node]].particle, promise);
 
     const checkComponent = (root: number) => {
       const top = components.pop() ?? root;
@@ -908,9 +920,9 @@ export const createLiveGraph = <State>(
       const membersByState = new Map<number, number[]>();
       for (let member = top; ; member = components.pop() ?? root) {
         members.add(member);
-        const siblings = membersByState.get(behavior.nodeStates[member]);
+        const siblings = membersByState.get(behavior.nodeStates.data[member]);
         if (siblings) siblings.push(member);
-        else membersByState.set(behavior.nodeStates[member], [member]);
+        else membersByState.set(behavior.nodeStates.data[member], [member]);
         links[member] = MAXIMUM_LINK;
         if (member === root) break;
       }
@@ -969,7 +981,7 @@ export const createLiveGraph = <State>(
           let unvisitedNext = -1;
           const countBeforeActions = remainingCount;
           const isTaken = getNodeSuccessors(behavior, currentNode).some((next, edge) => {
-            if (membersByState.has(behavior.nodeStates[next])) {
+            if (membersByState.has(behavior.nodeStates.data[next])) {
               if (!members.has(next) || !isAllowed(currentNode, edge)) return false;
               lastNext = next;
               model.infinitelyOftenActions.forEach((position, slot) => {
@@ -1012,7 +1024,7 @@ export const createLiveGraph = <State>(
       }
       const postfix = getClosingPath(root, currentNode, membersByState);
       for (let position = cycleStack.length - 1; position >= 0; position--) {
-        const state = behavior.nodeStates[cycleStack[position]];
+        const state = behavior.nodeStates.data[cycleStack[position]];
         if (postfix[postfix.length - 1] !== state) postfix.push(state);
       }
       const cycleState = prefix[prefix.length - 1];
@@ -1026,7 +1038,7 @@ export const createLiveGraph = <State>(
 
     const getClosingPath = (root: number, end: number, membersByState: Map<number, number[]>) => {
       if (end === root) return [];
-      const start = behavior.nodeStates[end];
+      const start = behavior.nodeStates.data[end];
       const parents = new Map<number, number>();
       const seen = new Set<number>([start]);
       const queue: [number, number][] = [];
@@ -1044,7 +1056,7 @@ export const createLiveGraph = <State>(
               path.push(start);
               return path;
             }
-            const nextState = behavior.nodeStates[next];
+            const nextState = behavior.nodeStates.data[next];
             if (!membersByState.has(nextState) || seen.has(nextState)) continue;
             seen.add(nextState);
             queue.push([nextState, state]);
