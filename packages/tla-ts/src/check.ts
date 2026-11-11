@@ -715,7 +715,9 @@ const searchStates = (
           const successors: LiveSuccessor[] = [];
           if (spec.next === undefined) return successors;
           const livenessSource = current.livenessSource;
+          const livenessState = current.livenessState;
           current.livenessSource = source;
+          current.livenessState = state;
           try {
             forEachSuccessor(
               spec.next,
@@ -736,6 +738,7 @@ const searchStates = (
             );
           } finally {
             current.livenessSource = livenessSource;
+            current.livenessState = livenessState;
           }
           return successors;
         },
@@ -749,10 +752,11 @@ const searchStates = (
   const canonicalizeState = createCanonicalizer();
   // The search keeps a state's values only while the state waits in the queue or is being
   // expanded, at current.index; a trace rebuilds the states on its path by replaying it from an
-  // initial state, matching each step's fingerprint. A search with liveness, whose graph refers
-  // back to stored states, or over an impure spec, which a replay cannot repeat, also keeps
-  // every state in retained.
-  const retained: Value[][] | undefined = liveness || isImpure(environment) ? [] : undefined;
+  // initial state, matching each step's fingerprint. The liveness checker keeps only indices and
+  // the truth of its predicates, evaluated while a state is expanded, so a lasso is rebuilt the
+  // same way. A search over an impure spec, which a replay cannot repeat, keeps every state in
+  // retained.
+  const retained: Value[][] | undefined = isImpure(environment) ? [] : undefined;
   const queue = createStateQueue(
     environment.variables.length,
     canonicalizeState,
@@ -891,6 +895,7 @@ const searchStates = (
     candidate: undefined,
     candidateLevel: 0,
     livenessSource: -1,
+    livenessState: undefined,
     rebuilt: undefined,
   };
   const traces = createTraceBuilder({
@@ -924,20 +929,22 @@ const searchStates = (
   runtime.isSeen = (state) =>
     !isUnfingerprintable(state) && findSeen(getFingerprintState(state)) !== -1;
   runtime.getBehavior = (state) => {
-    const index =
-      state === current.candidate
-        ? -1
-        : state === expanding
-          ? current.index
-          : (retained?.indexOf(state) ?? -1);
+    if (state === current.candidate) return [...getPath(current.index), state];
+    if (state === expanding) return getPath(current.index);
+    const source = current.livenessSource;
+    if (source !== -1) {
+      return state === current.livenessState ? getPath(source) : [...getPath(source), state];
+    }
+    const index = retained?.indexOf(state) ?? -1;
     return index === -1 ? [...getPath(current.index), state] : getPath(index);
   };
   // While a trace rebuilds a step, the state it replays from is current, so a random choice in
   // Next draws what it drew when the search expanded that state.
   runtime.getCurrentState = () =>
     current.rebuilt?.state ?? (current.index === -1 ? undefined : expanding);
-  runtime.setLivenessSource = (index) => {
+  runtime.setLivenessSource = (index, state) => {
     current.livenessSource = index ?? -1;
+    current.livenessState = index === undefined ? undefined : state;
   };
   runtime.getLevel = (state) => {
     const source = current.livenessSource;
@@ -948,7 +955,7 @@ const searchStates = (
     const rebuilt = current.rebuilt;
     if (rebuilt) return state === rebuilt.state ? rebuilt.level : rebuilt.level + 1;
     if (source !== -1) {
-      return state === getState(source) ? seen.getDepth(source) : seen.getDepth(source) + 1;
+      return state === current.livenessState ? seen.getDepth(source) : seen.getDepth(source) + 1;
     }
     if (state === current.candidate) return current.candidateLevel;
     if (current.index === -1) return 0;
@@ -1073,9 +1080,14 @@ const searchStates = (
         );
     }
     if (found.existing !== -1 && liveness) {
-      const stored = getState(found.existing);
-      const isStored = stored.every((value, position) => value === successor.state[position]);
-      liveSuccessors.push({ index: found.existing, state: isStored ? stored : successor.state });
+      // The stored values, where the search holds them, keep their identity for the liveness
+      // checker's caches; a state it no longer holds is not rebuilt for that.
+      const stored = found.existing === index ? state : retained?.[found.existing];
+      const isStored = stored?.every((value, position) => value === successor.state[position]);
+      liveSuccessors.push({
+        index: found.existing,
+        state: stored && isStored ? stored : successor.state,
+      });
     }
     const isNew = found.isInModel && found.existing === -1;
     if (isNew && liveness) liveSuccessors.push({ index: seen.count, state: successor.state });
@@ -1676,8 +1688,12 @@ const searchStates = (
   typedLasso?.states.forEach((entry) => {
     const step = lassoSteps.get(entry.index);
     const parent = lassoIndexes.get(entry.parent);
-    if (step && parent !== undefined)
+    const parentState = lassoSteps.get(entry.parent)?.successor.state;
+    if (step && parent !== undefined && parentState) {
+      Object.assign(current, { index: parent, isExpanding: true });
+      expanding = parentState;
       visitSuccessor(parent, step.successor, [], undefined, step.action);
+    }
     lassoIndexes.set(
       entry.index,
       parent === undefined ? (findStoredInitialState(entry.isState)?.index ?? -1) : seen.count - 1,

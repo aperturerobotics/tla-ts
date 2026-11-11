@@ -71,8 +71,13 @@ export interface LiveEvaluation<State> {
   // Whether a check's result for a state holds for every step from it.
   isShared: boolean;
   isSame: (left: State, right: State) => boolean;
-  // Evaluates the checks of a state the search found from the state at source.
-  evaluateFrom: <Result>(source: number | undefined, evaluate: () => Result) => Result;
+  // Evaluates the checks of a state the search found from the state at source, whose values are
+  // sourceState.
+  evaluateFrom: <Result>(
+    source: number | undefined,
+    sourceState: State | undefined,
+    evaluate: () => Result,
+  ) => Result;
 }
 
 interface Pool<Data extends Int32Array | Uint8Array> {
@@ -338,8 +343,8 @@ export const createLivenessChecker = (
       },
       isShared,
       isSame: isSameState,
-      evaluateFrom: (source, evaluate) => {
-        environment.runtime.setLivenessSource(source);
+      evaluateFrom: (source, sourceState, evaluate) => {
+        environment.runtime.setLivenessSource(source, sourceState);
         try {
           return evaluate();
         } finally {
@@ -514,7 +519,7 @@ export const createLiveGraph = <State>(
     row: Int8Array,
     offset: number,
   ) =>
-    evaluateFrom(source, () => {
+    evaluateFrom(source, state, () => {
       const checks = behavior.checks.states;
       const results = new Uint8Array(checks.length);
       checks.forEach((check, position) => {
@@ -535,7 +540,7 @@ export const createLiveGraph = <State>(
     results: Uint8Array,
     resultOffset: number,
   ) =>
-    evaluateFrom(source, () => {
+    evaluateFrom(source, state, () => {
       const actions = behavior.checks.actions;
       for (let position = 0; position < actions.length; position++) {
         if (!isShared) {
@@ -575,14 +580,17 @@ export const createLiveGraph = <State>(
     }
     return true;
   };
+  // isConsistent evaluates node's state checks on state, a successor of source, whose values are
+  // sourceState, or source itself.
   const isConsistent = (
     behavior: BehaviorGraph<State>,
     node: number,
     source: number | undefined,
+    sourceState: State | undefined,
     state: State,
     row: Int8Array,
     offset: number,
-  ) => evaluateFrom(source, () => holdsNode(behavior, node, state, row, offset));
+  ) => evaluateFrom(source, sourceState, () => holdsNode(behavior, node, state, row, offset));
 
   const isAccepting = (tableau: Tableau, node: number) => {
     if (!isAcceptingFound) return false;
@@ -715,7 +723,7 @@ export const createLiveGraph = <State>(
       checkAction(behavior, index, state, row, offset, state, createEdgeRows(1), 0, selfResults, 0);
     }
     for (const next of tableauNode.successors) {
-      if (!isConsistent(behavior, next, index, state, row, offset)) continue;
+      if (!isConsistent(behavior, next, index, state, state, row, offset)) continue;
       if (
         isAccepting(tableau, next) &&
         behavior.errorNode === undefined &&
@@ -752,7 +760,7 @@ export const createLiveGraph = <State>(
       );
       const isDone = behavior.isDone[successor.index] === true;
       for (const next of tableauNode.successors) {
-        if (!isConsistent(behavior, next, index, successor.state, successorRow, 0)) continue;
+        if (!isConsistent(behavior, next, index, state, successor.state, successorRow, 0)) continue;
         // Deviation from TLC: TLC records the node of a successor the search never stored, which it never expands.
         if (successor.index === -1) continue;
         const existing = getNodeId(behavior, successor.index, next);
@@ -778,11 +786,12 @@ export const createLiveGraph = <State>(
     actionResults: Uint8Array,
     stateResults: Uint8Array,
     index: number,
+    state: State,
   ) => {
     const atomCount = stateAtoms.size;
     // Whether each successor is consistent with each tableau node, node by node.
     const consistency = new Uint8Array(tableau.nodes.length * set.length);
-    evaluateFrom(index, () => {
+    evaluateFrom(index, state, () => {
       for (let node = 0; node < tableau.nodes.length; node++) {
         for (let position = 0; position < set.length; position++) {
           if (holdsNode(behavior, node, set[position].state, rows, position * atomCount)) {
@@ -1111,7 +1120,7 @@ export const createLiveGraph = <State>(
           continue;
         }
         for (let node = 0; node < tableau.initialCount; node++) {
-          if (!isConsistent(behavior, node, undefined, state, row, 0)) continue;
+          if (!isConsistent(behavior, node, undefined, undefined, state, row, 0)) continue;
           behavior.initial.push(
             getNodeId(behavior, index, node) ?? recordNode(behavior, index, node),
           );
@@ -1155,6 +1164,7 @@ export const createLiveGraph = <State>(
           actionResults,
           stateResults,
           index,
+          state,
         );
         if (accepted) return accepted;
       }

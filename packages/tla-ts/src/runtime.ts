@@ -10,7 +10,11 @@ export interface CheckerRuntime {
   getSpecification: () => Value;
   counterExample: Value | undefined;
   deferred: ((next: Value[]) => void) | undefined;
-  setLivenessSource: (index: number | undefined) => void;
+  /**
+   * Names the state whose liveness predicates are being evaluated, by its index and its values,
+   * or none.
+   */
+  setLivenessSource: (index: number | undefined, state?: Value[]) => void;
   getCurrentState: () => Value[] | undefined;
   getFingerprint: (state: Value[]) => bigint;
   getRandom: () => JavaRandom;

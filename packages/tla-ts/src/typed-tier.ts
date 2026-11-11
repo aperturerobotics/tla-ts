@@ -6358,7 +6358,7 @@ const search = (environment: Environment, check: TypedCheck, plains: Plains): Ty
         isShared: true,
         // Without symmetry, a state's index identifies it. With it, states of one class share it.
         isSame: isImaged ? isSame : () => true,
-        evaluateFrom: (_source, evaluate) => evaluate(),
+        evaluateFrom: (_source, _sourceState, evaluate) => evaluate(),
       },
       {
         getFingerprint: (successor) =>

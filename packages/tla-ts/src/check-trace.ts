@@ -30,6 +30,8 @@ export interface SearchPosition {
   candidate: Value[] | undefined;
   candidateLevel: number;
   livenessSource: number;
+  /** The values of the state at livenessSource, which the liveness checker holds. */
+  livenessState: Value[] | undefined;
   rebuilt: RebuiltState | undefined;
 }
 
