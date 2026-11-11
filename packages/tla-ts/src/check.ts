@@ -192,6 +192,20 @@ export interface InitialStateViolation {
 
 export type OutputLine = string | InitialStatesProgress | InitialStateViolation;
 
+/**
+ * Why a search asked for several workers checks the model on the calling thread instead: before
+ * it starts them, or after it stops them, from the initial states again.
+ */
+export type FallbackReason =
+  /** The search ordered a string it created against another; workers don't share that order. */
+  | { kind: "string"; string: string }
+  /** A worker found a violation or a deadlock; one thread rebuilds its trace. */
+  | { kind: "violation" }
+  /** A worker failed, such as by running out of memory. */
+  | { kind: "error"; message: string }
+  /** The model or the options use a feature only the calling thread checks. */
+  | { kind: "unsupported"; feature: string };
+
 export type CheckProgress =
   | { kind: "parsed" }
   | { kind: "constant-level-invariant"; name: string }
@@ -212,7 +226,7 @@ export type CheckProgress =
       statistics: SearchStatistics;
     }
   | { kind: "liveness-finished" }
-  | { kind: "sequential-fallback"; string: string }
+  | { kind: "sequential-fallback"; reason: FallbackReason }
   | { kind: "warning"; code: number; text: string }
   | { kind: "violation"; status: CheckStatus; violation: Violation }
   | ({ kind: "java-override" } & JavaOverride);
@@ -358,7 +372,8 @@ export const checkSequentially = (options: CheckOptions): CheckResult => {
 };
 
 const PERIODIC_START = 3000;
-const PROGRESS_INTERVAL = 60_000;
+/** How often a breadth-first search reports its progress, in milliseconds. */
+export const PROGRESS_INTERVAL = 60_000;
 const LIVENESS_GROWTH = 0.1;
 const LIVENESS_RATIO = 0.2;
 

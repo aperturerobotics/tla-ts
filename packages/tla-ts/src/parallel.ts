@@ -4,7 +4,9 @@ import {
   type CheckOptions,
   type CheckProgress,
   type CheckResult,
+  type FallbackReason,
   type InitialStates,
+  PROGRESS_INTERVAL,
 } from "./check";
 import { parseConfig, type ModelConfig } from "./config";
 import { TlaEvaluationError } from "./errors";
@@ -63,7 +65,7 @@ interface LevelMessage {
 
 export type WorkerMessage =
   | { type: "ready" }
-  | { type: "abort"; string?: string }
+  | { type: "abort"; reason: FallbackReason }
   | { type: "paused" }
   | LevelMessage;
 
@@ -90,10 +92,8 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
     reported.add(getKey(progress));
     options.onProgress?.(progress);
   };
-  const fallBack = (createdString?: string) => {
-    if (createdString !== undefined) {
-      options.onProgress?.({ kind: "sequential-fallback", string: createdString });
-    }
+  const fallBack = (reason?: FallbackReason) => {
+    if (reason !== undefined) options.onProgress?.({ kind: "sequential-fallback", reason });
     let skippedCount = printedCount;
     return checkSequentially({
       ...options,
@@ -105,17 +105,17 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
     });
   };
   const workerCount = options.workers ?? 1;
-  const isSequential =
-    workerCount < 2 ||
-    typeof SharedArrayBuffer !== "function" ||
-    options.dump !== undefined ||
-    options.coverage !== undefined ||
-    options.isContinued === true ||
-    config.view !== undefined ||
-    config.postconditions.length > 0 ||
-    config.possible.length > 0 ||
-    (options.moduleOperators?.length ?? 0) > 0;
-  if (isSequential) return fallBack();
+  if (workerCount < 2) return fallBack();
+  const unsupported = (feature: string) => fallBack({ kind: "unsupported", feature });
+  if (typeof SharedArrayBuffer !== "function")
+    return unsupported("a runtime without SharedArrayBuffer");
+  if (options.dump !== undefined) return unsupported("-dump");
+  if (options.coverage !== undefined) return unsupported("-coverage");
+  if (options.isContinued === true) return unsupported("-continue");
+  if (config.view !== undefined) return unsupported("VIEW");
+  if (config.postconditions.length > 0) return unsupported("POSTCONDITION");
+  if (config.possible.length > 0) return unsupported("possible states");
+  if ((options.moduleOperators?.length ?? 0) > 0) return unsupported("module operators");
   const modules = new Map<string, string | undefined>();
   const loadModule = (name: string) => {
     const source = options.loadModule?.(name);
@@ -148,15 +148,10 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
     report,
   );
   if (findAssumptionViolation(specification.assumptions, environment)) return fallBack();
-  if (
-    !search ||
-    search.spec.init === undefined ||
-    search.spec.next === undefined ||
-    search.properties.liveness.length > 0 ||
-    isImpure(environment)
-  ) {
+  if (!search || search.spec.init === undefined || search.spec.next === undefined)
     return fallBack();
-  }
+  if (search.properties.liveness.length > 0) return unsupported("temporal properties");
+  if (isImpure(environment)) return unsupported("operators with side effects (such as TLCSet)");
 
   const canonicalize = createCanonicalizer();
   let sharedFingerprints = createSharedFingerprints();
@@ -221,7 +216,9 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
     return fallBack();
   }
   const unorderedString = getUnorderedString();
-  if (unorderedString !== undefined) return fallBack(unorderedString);
+  if (unorderedString !== undefined) {
+    return fallBack({ kind: "string", string: unorderedString });
+  }
   statistics.depth = statistics.generatedStates === 0 ? 0 : 1;
   statistics.initialStates = {
     generated: statistics.generatedStates,
@@ -252,7 +249,8 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
       spawnWorker(
         new URL("./parallel-worker.js", import.meta.url),
         (message) => onMessage(message as WorkerMessage),
-        () => onMessage({ type: "abort" }),
+        (error) =>
+          onMessage({ type: "abort", reason: { kind: "error", message: describe(error) } }),
       ),
     ),
   );
@@ -291,34 +289,34 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
     };
     worker.postMessage(message, [...ports.filter((port) => port !== undefined), seed.words.buffer]);
   });
-  const isAborted = (messages: WorkerMessage[]) =>
-    messages.some((message) => message.type === "abort");
+  const findAbort = (messages: WorkerMessage[]) =>
+    messages.find((message) => message.type === "abort")?.reason;
   const send = (message: CoordinatorMessage) =>
     workers.forEach((worker) => worker.postMessage(message));
   const collectLevels = async (messages: WorkerMessage[]): Promise<WorkerMessage[]> => {
     const pausedCount = messages.filter((message) => message.type === "paused").length;
-    if (pausedCount === 0 || isAborted(messages)) return messages;
+    if (pausedCount === 0 || findAbort(messages)) return messages;
     sharedFingerprints = growSharedFingerprints(sharedFingerprints);
     const resumed = waitForReports(pausedCount);
     send({ type: "resize", fingerprints: sharedFingerprints });
     const unpaused = messages.filter((message) => message.type !== "paused");
     return [...unpaused, ...(await collectLevels(await resumed))];
   };
-  if (isAborted(await ready)) {
+  const startAbort = findAbort(await ready);
+  if (startAbort) {
     terminate();
-    return fallBack();
+    return fallBack(startAbort);
   }
+  let progressAt = performance.now() + PROGRESS_INTERVAL;
   for (;;) {
     const levelReports = waitForReports(workerCount);
     requests.forEach((_request, index) => Atomics.store(requests, index, 0));
     send({ type: "level" });
     const messages = await collectLevels(await levelReports);
-    if (isAborted(messages)) {
+    const abort = findAbort(messages);
+    if (abort) {
       terminate();
-      const aborted = messages.find(
-        (message) => message.type === "abort" && message.string !== undefined,
-      );
-      return fallBack(aborted?.type === "abort" ? aborted.string : undefined);
+      return fallBack(abort);
     }
     const levels = messages.flatMap((message) => (message.type === "level" ? [message] : []));
     const added = levels.reduce((sum, message) => sum + message.added, 0);
@@ -335,5 +333,26 @@ export const check = async (options: CheckOptions): Promise<CheckResult> => {
       return createSuccess();
     }
     statistics.depth++;
+    if (performance.now() >= progressAt) {
+      progressAt = performance.now() + PROGRESS_INTERVAL;
+      // Progress goes straight to the caller: report() would mark its kind as seen and hide the
+      // progress of a later fallback search.
+      options.onProgress?.({
+        kind: "progress",
+        statistics: {
+          generatedStates: statistics.generatedStates,
+          distinctStates: statistics.distinctStates,
+          queuedStates: added,
+          depth: statistics.depth,
+          coverage: undefined,
+        },
+      });
+    }
   }
 };
+
+/** Returns the message of a worker's error event or thrown value. */
+const describe = (error: unknown) =>
+  error instanceof Error
+    ? error.message
+    : String((error as { message?: unknown } | undefined)?.message ?? error);

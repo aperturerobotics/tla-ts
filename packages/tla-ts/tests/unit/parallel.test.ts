@@ -89,7 +89,9 @@ describe("check with workers matches TLC", () => {
       config: readFileSync(join(FIXTURES, "strings", "RuntimeStrings.cfg"), "utf8"),
       workers: 2,
       onProgress: (progress) => {
-        if (progress.kind === "sequential-fallback") ordered.push(progress.string);
+        if (progress.kind === "sequential-fallback" && progress.reason.kind === "string") {
+          ordered.push(progress.reason.string);
+        }
       },
     });
     expect(getCounts(result)).toEqual([115, 97, 6]);

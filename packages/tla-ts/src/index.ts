@@ -4,6 +4,7 @@ export type {
   CheckResult,
   CheckStatus,
   EvaluationFailure,
+  FallbackReason,
   ModuleOperator,
   TraceSpecOptions,
   TraceStep,

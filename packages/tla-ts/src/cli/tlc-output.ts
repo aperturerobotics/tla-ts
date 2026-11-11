@@ -13,6 +13,7 @@ import type {
   Postcondition,
   CheckResult,
   CheckStatus,
+  FallbackReason,
   InitialStates,
   SearchStatistics,
   TraceStep,
@@ -332,9 +333,7 @@ export const printCheckProgress = (
       printLivenessEnd(printer, timing);
       return;
     case "sequential-fallback":
-      process.stderr.write(
-        `Warning: the search ordered the string ${JSON.stringify(progress.string)} against another string it created, so tla-ts checks the model again with one worker. Workers don't agree on the order of strings the search creates.\n`,
-      );
+      process.stderr.write(`Warning: ${describeFallback(progress.reason)}\n`);
       return;
     case "warning":
       print(progress.code, MESSAGE_LEVEL.warning, progress.text);
@@ -687,3 +686,18 @@ const printSimulationProgress = (printer: MessagePrinter, statistics: Simulation
     MESSAGE_LEVEL.none,
     `Progress(${statistics.traces}) at ${formatTlcDate(new Date())}: ${statistics.generatedStates} states generated, -1 distinct states found, -1 states left on queue.`,
   );
+
+/** Explains why a search with several workers checks the model again with one. */
+const describeFallback = (reason: FallbackReason) => {
+  const again = "so tla-ts checks the model again from its initial states with one worker";
+  switch (reason.kind) {
+    case "string":
+      return `the search ordered the string ${JSON.stringify(reason.string)} against another string it created, ${again}. Workers don't agree on the order of strings the search creates.`;
+    case "violation":
+      return `a worker found a violation or a deadlock, ${again} to build its trace.`;
+    case "error":
+      return `a worker failed (${reason.message}), ${again}.`;
+    case "unsupported":
+      return `workers don't check ${reason.feature} yet, so tla-ts checks the model with one worker.`;
+  }
+};

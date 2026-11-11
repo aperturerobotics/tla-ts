@@ -46,7 +46,10 @@ const runWorker = (start: StartMessage, parent: Port) => {
   );
   const nextAction = search?.spec.next;
   if (!search || nextAction === undefined)
-    return parent.postMessage({ type: "abort" } satisfies WorkerMessage);
+    return parent.postMessage({
+      type: "abort",
+      reason: { kind: "error", message: "the worker found no next-state action" },
+    } satisfies WorkerMessage);
   const workerIndex = start.index;
   const canonicalize = createCanonicalizer();
   const decode = createStateDecoder(environment.variables.length);
@@ -161,7 +164,7 @@ const runWorker = (start: StartMessage, parent: Port) => {
   const report = (message: WorkerMessage) =>
     parent.postMessage(message, message.type === "level" ? [message.fingerprints.buffer] : []);
 
-  const runLevel = async (): Promise<WorkerMessage | undefined> => {
+  const runLevel = async (): Promise<WorkerMessage> => {
     const expansion: Expansion = {
       states: frontier,
       origin: 0,
@@ -177,7 +180,7 @@ const runWorker = (start: StartMessage, parent: Port) => {
     };
     for (;;) {
       const status = expand(expansion);
-      if (status === undefined) return undefined;
+      if (status === undefined) return { type: "abort", reason: { kind: "violation" } };
       // HACK: Bun frees memory on event loop timers, so a long level returns to the loop.
       if (status === "break") {
         await takeBreak();
@@ -195,7 +198,9 @@ const runWorker = (start: StartMessage, parent: Port) => {
       if (!(await steal(expansion))) break;
     }
     const unorderedString = getUnorderedString();
-    if (unorderedString !== undefined) return { type: "abort", string: unorderedString };
+    if (unorderedString !== undefined) {
+      return { type: "abort", reason: { kind: "string", string: unorderedString } };
+    }
     frontier = expansion.next;
     Atomics.store(remaining, workerIndex, frontier.length);
     return {
@@ -209,8 +214,8 @@ const runWorker = (start: StartMessage, parent: Port) => {
 
   const startLevel = () => {
     runLevel().then(
-      (message) => report(message ?? { type: "abort" }),
-      () => report({ type: "abort" }),
+      (message) => report(message),
+      (error) => report(abortWith(error)),
     );
   };
   parent.addEventListener("message", (event) => {
@@ -232,10 +237,16 @@ void getParentPort().then((parent) => {
     parent.removeEventListener?.("message", onStart);
     try {
       runWorker(message, parent);
-    } catch {
-      parent.postMessage({ type: "abort" } satisfies WorkerMessage);
+    } catch (error) {
+      parent.postMessage(abortWith(error));
     }
   };
   parent.addEventListener("message", onStart);
   parent.start?.();
+});
+
+/** Returns the abort that carries a worker's failure to the coordinator. */
+const abortWith = (error: unknown): WorkerMessage => ({
+  type: "abort",
+  reason: { kind: "error", message: error instanceof Error ? error.message : String(error) },
 });
