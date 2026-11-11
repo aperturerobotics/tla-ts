@@ -4,9 +4,14 @@ import type { Value } from "./values";
 /**
  * The first-in, first-out queue of states a breadth-first search has found and not yet
  * expanded. Only the chunk being read and the chunk being written hold values; each full chunk
- * between them is stored encoded, in a file of its own under a new directory in the spill
- * directory where the runtime has a file system and in memory otherwise, and decoded when its
+ * between them is stored compact, in a file of its own under a new directory in the spill
+ * directory where the runtime has a file system and in memory otherwise, and expanded when its
  * turn comes. A chunk whose values have no encoding stays as it is.
+ *
+ * A compact chunk keeps, for each variable, the distinct values its states take, each encoded
+ * once, and for each state the index of its value in that table. A search changes few variables
+ * per step, so a variable takes few values across a chunk, and a state costs a byte or two per
+ * variable rather than its full encoding.
  */
 export interface StateQueue {
   readonly size: number;
@@ -28,8 +33,20 @@ interface FileSystem {
   rmSync: (path: string, options: { recursive: boolean; force: boolean }) => void;
 }
 
-// A chunk is its values, its encoding in memory, or the file holding its encoding.
-type StoredChunk = Value[][] | EncodedStates | ChunkFile;
+// A chunk is its values, its compact form in memory, or the file holding its compact form.
+type StoredChunk = Value[][] | CompactChunk | ChunkFile;
+
+interface CompactChunk {
+  count: number;
+  columns: Column[];
+}
+
+// A column is one variable's distinct values in a chunk, encoded as one-variable states, and
+// each state's index into them.
+interface Column {
+  table: EncodedStates;
+  ids: Uint8Array | Uint16Array;
+}
 
 interface ChunkFile {
   path: string;
@@ -49,28 +66,114 @@ const getFileSystem = (spillDirectory: string | undefined) => {
   return fs && os && { fs, directory: spillDirectory ?? os.tmpdir() };
 };
 
+const decodeTable = createStateDecoder(1);
+
+// compact returns chunk's compact form, or undefined when a value has no encoding. A value seen
+// before in its column, as the same object or with the same encoding, reuses its index.
+const compact = (chunk: Value[][], width: number): CompactChunk | undefined => {
+  const columns: Column[] = [];
+  for (let column = 0; column < width; column++) {
+    const encoder = createStateEncoder();
+    const byIdentity = new Map<Value, number>();
+    const byWords = new Map<string, number>();
+    const ids = new Uint16Array(chunk.length);
+    let size = 0;
+    for (let index = 0; index < chunk.length; index++) {
+      const value = chunk[index][column];
+      let id = byIdentity.get(value);
+      if (id === undefined) {
+        const start = encoder.length;
+        if (!encoder.encode([value])) return undefined;
+        const key = encoder.key(start);
+        id = byWords.get(key);
+        if (id === undefined) byWords.set(key, (id = size++));
+        else encoder.drop(start);
+        byIdentity.set(value, id);
+      }
+      ids[index] = id;
+    }
+    // A chunk holds at most CHUNK_SIZE states, so every index fits in 16 bits.
+    columns.push({ table: encoder.finish(), ids: size <= 1 << 8 ? Uint8Array.from(ids) : ids });
+  }
+  return { count: chunk.length, columns };
+};
+
+// expand returns a compact chunk's states. It canonicalizes each table value once, so states
+// share the values they had in common when queued.
+const expand = (chunk: CompactChunk, canonicalize: (state: Value[]) => void): Value[][] => {
+  // Columns run in variable order, so pushing each column's value builds every state in order.
+  const states = Array.from({ length: chunk.count }, (): Value[] => []);
+  for (const { table, ids } of chunk.columns) {
+    const values = decodeTable(table).map((state) => state[0]);
+    canonicalize(values);
+    for (let index = 0; index < chunk.count; index++) states[index].push(values[ids[index]]);
+  }
+  return states;
+};
+
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-// A chunk file is three 32-bit words, the state count, word count and string bytes, then the
-// words, then the strings as JSON.
-const toBytes = (encoded: EncodedStates) => {
-  const strings = textEncoder.encode(JSON.stringify(encoded.strings));
-  const bytes = new Uint8Array(12 + encoded.words.length * 4 + strings.length);
-  new Int32Array(bytes.buffer, 0, 3).set([encoded.count, encoded.words.length, strings.length]);
-  bytes.set(new Uint8Array(encoded.words.buffer, 0, encoded.words.length * 4), 12);
-  bytes.set(strings, 12 + encoded.words.length * 4);
+const align = (bytes: number) => (bytes + 3) & ~3;
+
+// A chunk file is the state count and width, then for each column its value count, word count,
+// string bytes and bytes per index, then each column's words, its strings as JSON and its
+// indices, each section padded to four bytes.
+const toBytes = (chunk: CompactChunk) => {
+  const strings = chunk.columns.map(({ table }) =>
+    textEncoder.encode(JSON.stringify(table.strings)),
+  );
+  const header = 8 + chunk.columns.length * 16;
+  let total = header;
+  chunk.columns.forEach(({ table, ids }, column) => {
+    total += table.words.length * 4 + align(strings[column].length) + align(ids.byteLength);
+  });
+  const bytes = new Uint8Array(total);
+  const head = new Int32Array(bytes.buffer, 0, header / 4);
+  head[0] = chunk.count;
+  head[1] = chunk.columns.length;
+  let offset = header;
+  chunk.columns.forEach(({ table, ids }, column) => {
+    head.set(
+      [table.count, table.words.length, strings[column].length, ids.BYTES_PER_ELEMENT],
+      2 + column * 4,
+    );
+    bytes.set(
+      new Uint8Array(table.words.buffer, table.words.byteOffset, table.words.byteLength),
+      offset,
+    );
+    offset += table.words.byteLength;
+    bytes.set(strings[column], offset);
+    offset += align(strings[column].length);
+    bytes.set(new Uint8Array(ids.buffer, ids.byteOffset, ids.byteLength), offset);
+    offset += align(ids.byteLength);
+  });
   return bytes;
 };
 
-const fromBytes = (bytes: Uint8Array): EncodedStates => {
+const ID_ARRAYS = { 1: Uint8Array, 2: Uint16Array } as const;
+
+const fromBytes = (bytes: Uint8Array): CompactChunk => {
   const aligned = bytes.byteOffset % 4 === 0 ? bytes : bytes.slice();
-  const [count, wordCount, stringBytes] = new Int32Array(aligned.buffer, aligned.byteOffset, 3);
-  const words = new Int32Array(aligned.buffer, aligned.byteOffset + 12, wordCount);
-  const strings = JSON.parse(
-    textDecoder.decode(aligned.subarray(12 + wordCount * 4, 12 + wordCount * 4 + stringBytes)),
-  ) as string[];
-  return { count, words, strings };
+  // A file read returns a plain ArrayBuffer, never a shared one.
+  const buffer = aligned.buffer as ArrayBuffer;
+  const byteOffset = aligned.byteOffset;
+  const [count, width] = new Int32Array(buffer, byteOffset, 2);
+  const head = new Int32Array(buffer, byteOffset + 8, width * 4);
+  let offset = 8 + width * 16;
+  const columns = Array.from({ length: width }, (_, column): Column => {
+    const [tableCount, wordCount, stringBytes, idBytes] = head.subarray(column * 4, column * 4 + 4);
+    const words = new Int32Array(buffer, byteOffset + offset, wordCount);
+    offset += wordCount * 4;
+    const strings = JSON.parse(
+      textDecoder.decode(aligned.subarray(offset, offset + stringBytes)),
+    ) as string[];
+    offset += align(stringBytes);
+    const ids = new ID_ARRAYS[idBytes as 1 | 2](buffer, byteOffset + offset, count);
+    offset += align(count * idBytes);
+    return { table: { count: tableCount, words, strings }, ids };
+  });
+  return { count, columns };
 };
 
 /**
@@ -84,7 +187,6 @@ export const createStateQueue = (
   isEncoded: boolean,
   spillDirectory?: string,
 ): StateQueue => {
-  const decode = createStateDecoder(width);
   const files = isEncoded ? getFileSystem(spillDirectory) : undefined;
   let directory: string | undefined;
   let fileCount = 0;
@@ -99,9 +201,8 @@ export const createStateQueue = (
 
   const store = (chunk: Value[][]): StoredChunk => {
     if (!isEncoded) return chunk;
-    const encoder = createStateEncoder();
-    if (!chunk.every(encoder.encode)) return chunk;
-    const encoded = encoder.finish();
+    const encoded = compact(chunk, width);
+    if (!encoded) return chunk;
     if (!files) return encoded;
     directory ??= files.fs.mkdtempSync(`${files.directory}/tla-ts-queue-`);
     const path = `${directory}/${fileCount++}`;
@@ -113,16 +214,12 @@ export const createStateQueue = (
   };
   const load = (chunk: StoredChunk): Value[][] => {
     if (Array.isArray(chunk)) return chunk;
-    if (!("path" in chunk)) return decode(chunk).map(withCanonical);
+    if (!("path" in chunk)) return expand(chunk, canonicalize);
     const encoded = fromBytes(files!.fs.readFileSync(chunk.path));
     files!.fs.rmSync(chunk.path, { recursive: false, force: true });
     spillBytes -= chunk.bytes;
     spillStates -= chunk.states;
-    return decode(encoded).map(withCanonical);
-  };
-  const withCanonical = (state: Value[]) => {
-    canonicalize(state);
-    return state;
+    return expand(encoded, canonicalize);
   };
   return {
     get size() {

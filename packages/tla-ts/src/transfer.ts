@@ -29,6 +29,12 @@ export interface EncodedStates {
 
 interface StateEncoder {
   encode: (state: Value[]) => boolean;
+  /** The words written so far; a mark for key and drop. */
+  readonly length: number;
+  /** Returns the words written since start as a string, exact within this encoder. */
+  key: (start: number) => string;
+  /** Removes the state written since start, the last one encoded. */
+  drop: (start: number) => void;
   finish: () => EncodedStates;
 }
 
@@ -104,6 +110,21 @@ export const createStateEncoder = (): StateEncoder => {
       }
       length = start;
       return false;
+    },
+    get length() {
+      return length;
+    },
+    key: (start) => {
+      let key = "";
+      for (let index = start; index < length; index++) {
+        const word = words[index];
+        key += String.fromCharCode(word & 0xffff, word >>> 16);
+      }
+      return key;
+    },
+    drop: (start) => {
+      length = start;
+      count--;
     },
     finish: () => ({ words: words.slice(0, length), strings, count }),
   };
