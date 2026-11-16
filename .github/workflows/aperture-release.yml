@@ -1,0 +1,86 @@
+name: Aperture Release
+
+# Publishes the tla-ts package as @aptre/tla-ts when an aperture-N tag is pushed, at version
+# <upstream version>-aperture.N, with provenance through npm's trusted publishing (OIDC); no npm
+# token is stored. The package keeps its upstream name in the repository so the workspace and
+# rebases onto upstream stay untouched; this workflow renames it only for the published copy.
+
+on:
+  push:
+    tags:
+      - "aperture-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aperture-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.18.0
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@11
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Name the package @aptre/tla-ts at the tag's version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const match = /^aperture-(\d+)$/.exec(process.env.TAG);
+            if (!match) throw new Error(`tag ${process.env.TAG} is not aperture-<number>`);
+            const path = "packages/tla-ts/package.json";
+            const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
+            manifest.name = "@aptre/tla-ts";
+            manifest.version = `${manifest.version}-aperture.${match[1]}`;
+            // Provenance requires the repository to match the one that publishes.
+            manifest.repository = {
+              type: "git",
+              url: "git+https://github.com/aperturerobotics/tla-ts.git",
+            };
+            fs.writeFileSync(path, JSON.stringify(manifest, null, 2) + "\n");
+            console.log(`Publishing ${manifest.name}@${manifest.version}`);
+          '
+
+      # npm publish leaves a bin path written as ./dist/cli.js out of the registry's metadata;
+      # npm pkg fix writes it as dist/cli.js. prepublishOnly builds the package and prepack copies
+      # the README and license into it.
+      - name: Publish to npm
+        working-directory: packages/tla-ts
+        run: |
+          npm pkg fix
+          npm publish --access public --tag latest
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" --generate-notes --repo "${{ github.repository }}"
